@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Release the Dogs</title>
+<meta name="description" content="A pack of greyhounds. A small jail full of suits. Drag one out.">
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; overflow: hidden; overscroll-behavior: none; }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: none;
+           user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="A pack of greyhounds running around. Drag a suit out of the jail at the bottom and drop it."></canvas>
+<script>
+(() => {
+'use strict';
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const TAU = Math.PI * 2;
+const K = 0.6;            // ground-plane foreshortening: screenY = groundY * K
+const INK = '#000';
+
+let W = 0, H = 0, S = 1, time = 0;
+const dogs = [], suits = [], scraps = [], remains = [];
+const pointer = { x: 0, y: 0, active: false, down: false, samples: [] };
+const jail = { x: 0, y: 0, w: 0, h: 0 };
+let held = null;          // the suit currently in hand
+let everReleased = false, hintAlpha = 1;
+const wander = { x: 0, y: 0, t: 0 };
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const hyp = Math.hypot;
+
+/* ------------------------------------------------------------ layout */
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  S = clamp(Math.min(W, H) / 760, 0.62, 1.05);
+  jail.w = 138 * S; jail.h = 84 * S;
+  jail.x = W / 2; jail.y = H - 38 * S;             // floor line of the jail
+  const want = clamp(Math.round(W * H / 105000), 6, 12);
+  while (dogs.length < want) dogs.push(makeDog());
+  dogs.length = want;
+}
+
+/* -------------------------------------------------------------- dogs */
+
+function makeDog() {
+  const a = rand(0, TAU);
+  return {
+    x: rand(0, W || 800), y: rand(0, (H || 600) / K),
+    vx: Math.cos(a) * 150, vy: Math.sin(a) * 150,
+    turn: 0, cruise: rand(190, 250), top: rand(335, 395),
+    phase: rand(0, TAU), gait: 1, face: 1, tilt: 0, fore: 1,
+    eating: false, eatAmt: 0, target: null, size: rand(0.92, 1.08),
+  };
+}
+
+function updateDogs(dt) {
+  const n = dogs.length;
+  let cx = 0, cy = 0, ax = 0, ay = 0;
+  for (const d of dogs) { cx += d.x; cy += d.y; ax += d.vx; ay += d.vy; }
+  cx /= n; cy /= n;
+  const al = hyp(ax, ay) || 1; ax /= al; ay /= al;
+
+  // the pack drifts toward a wandering point so it covers the whole page
+  wander.t -= dt;
+  if (wander.t <= 0 || hyp(wander.x - cx, wander.y - cy) < 140) {
+    wander.x = rand(0.08, 0.92) * W; wander.y = rand(0.1, 0.85) * H / K; wander.t = rand(3, 7);
+  }
+  const pace = 0.82 + 0.3 * Math.sin(time * 0.31) + 0.14 * Math.sin(time * 0.83 + 2);
+  const prey = suits.filter(s => s.state !== 'held' && s.state !== 'stuck');
+
+  dogs.forEach((d, i) => {
+    let dvx = 0, dvy = 0, accel = 1300;
+    let best = null, bd = 1e9;
+    for (const s of prey) { const q = hyp(s.x - d.x, s.y - d.y); if (q < bd) { bd = q; best = s; } }
+    d.target = best; d.eating = false;
+
+    if (best && best.state === 'down') {
+      // gather round and eat
+      const a = i / n * TAU + best.seed, r = 58 * S;
+      const tx = best.x + Math.cos(a) * r, ty = best.y + Math.sin(a) * r;
+      const dx = tx - d.x, dy = ty - d.y, q = hyp(dx, dy);
+      if (q < 12 * S || (d.eatAmt > 0.5 && q < 26 * S)) {
+        d.eating = true;
+        const sx = best.x - d.x;
+        d.face = Math.abs(sx) > 8 ? Math.sign(sx) : (i % 2 ? 1 : -1);
+      } else {
+        const sp = Math.min(d.top * S, q * 5);
+        dvx = dx / q * sp; dvy = dy / q * sp;
+      }
+      accel = 2200;
+    } else if (best) {
+      // chase, leading the target a little
+      const lead = Math.min(0.35, bd / 900);
+      const dx = best.x + best.vx * lead - d.x, dy = best.y + best.vy * lead - d.y, q = hyp(dx, dy) || 1;
+      dvx = dx / q * d.top * S; dvy = dy / q * d.top * S;
+    } else if (pointer.active) {
+      // ring around the cursor
+      const tight = held ? 0.72 : 1;
+      const r = (88 + n * 5) * S * tight;
+      const a = i / n * TAU + time * (held ? 1.5 : 0.75);
+      const tx = pointer.x + Math.cos(a) * r, ty = pointer.y / K + Math.sin(a) * r;
+      const dx = tx - d.x, dy = ty - d.y, q = hyp(dx, dy) || 1;
+      const sp = Math.min(d.top * 1.05 * S, q * 4.5);
+      dvx = dx / q * sp; dvy = dy / q * sp;
+    } else {
+      // free running: loose flock
+      accel = 430;
+      d.turn = clamp(d.turn + rand(-1, 1) * dt * 3.2, -0.7, 0.7);
+      const h = Math.atan2(d.vy, d.vx) + d.turn;
+      let ux = Math.cos(h), uy = Math.sin(h);
+      const tx = cx * 0.45 + wander.x * 0.55, ty = cy * 0.45 + wander.y * 0.55;
+      const dx = tx - d.x, dy = ty - d.y, q = hyp(dx, dy) || 1;
+      const pull = clamp((q - 70) / 260, 0, 1) * 0.95;
+      ux += dx / q * pull + ax * 0.3; uy += dy / q * pull + ay * 0.3;
+      const m = 50, sy = d.y * K;
+      if (d.x < m) ux += (m - d.x) / m; else if (d.x > W - m) ux -= (d.x - W + m) / m;
+      if (sy < m) uy += (m - sy) / m; else if (sy > H - m) uy -= (sy - H + m) / m;
+      const ul = hyp(ux, uy) || 1, sp = d.cruise * pace * S;
+      dvx = ux / ul * sp; dvy = uy / ul * sp;
+    }
+
+    // keep a little personal space
+    if (!d.eating) for (const o of dogs) {
+      if (o === d) continue;
+      const dx = d.x - o.x, dy = d.y - o.y, q = hyp(dx, dy), R = 46 * S;
+      if (q < R && q > 0.01) { const f = (R - q) / R * 260; dvx += dx / q * f; dvy += dy / q * f; }
+    }
+
+    if (d.eating) { d.vx *= Math.exp(-dt * 14); d.vy *= Math.exp(-dt * 14); }
+    else {
+      let ex = dvx - d.vx, ey = dvy - d.vy; const el = hyp(ex, ey), mx = accel * dt;
+      if (el > mx) { ex *= mx / el; ey *= mx / el; }
+      d.vx += ex; d.vy += ey;
+    }
+    d.x += d.vx * dt; d.y += d.vy * dt;
+
+    const svx = d.vx, svy = d.vy * K, sp = hyp(svx, svy);
+    d.gait += (clamp(sp / (210 * S), 0, 1) - d.gait) * Math.min(1, dt * 8);
+    d.phase += dt * (3 + sp / S * 0.04) * (sp > 6 ? 1 : 0);
+    if (!d.eating && Math.abs(svx) > 22) d.face = Math.sign(svx);
+    const vert = sp > 20 ? svy / sp : 0;
+    d.tilt += (vert * 0.12 * d.face - d.tilt) * Math.min(1, dt * 6);
+    d.fore += ((1 - 0.38 * Math.abs(vert)) - d.fore) * Math.min(1, dt * 6);
+    d.eatAmt += ((d.eating ? 1 : 0) - d.eatAmt) * Math.min(1, dt * 9);
+  });
+}
+
+function limb(hx, hy, a1, l1, a2, l2, w1, w2) {
+  const kx = hx + Math.sin(a1) * l1, ky = hy + Math.cos(a1) * l1;
+  const fx = kx + Math.sin(a2) * l2, fy = ky + Math.cos(a2) * l2;
+  ctx.lineWidth = w1; ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(kx, ky); ctx.stroke();
+  ctx.lineWidth = w2; ctx.beginPath(); ctx.moveTo(kx, ky); ctx.lineTo(fx, fy); ctx.stroke();
+  return [fx, fy];
+}
+
+function drawDog(d) {
+  const g = d.gait, p = d.phase, e = d.eatAmt, s = S * d.size;
+  ctx.save();
+  ctx.translate(d.x, d.y * K);
+  ctx.scale(d.face * s * d.fore, s);
+  ctx.translate(0, -Math.max(0, Math.sin(p * 1 + 0.6)) * 5 * g);
+  const chew = e * Math.sin(time * 17 + d.phase) * 0.05;
+  // pivot on the hips
+  ctx.translate(-20, -20);
+  ctx.rotate(d.tilt * (1 - e) + Math.sin(p) * 0.07 * g + e * 0.24 + chew);
+  ctx.translate(20, 20);
+  ctx.fillStyle = ctx.strokeStyle = INK; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+
+  // legs: double-suspension gallop, front pair opposite the hind pair
+  const sw = 1.05 * g;
+  for (let k = 0; k < 2; k++) {
+    const pf = p + k * 0.55, ph = p + Math.PI * 0.92 + k * 0.55;
+    const fa = sw * Math.sin(pf) * (1 - e) + e * (0.75 - k * 0.25);
+    const fb = (0.15 + 1.1 * Math.max(0, -Math.cos(pf))) * g * (1 - e);
+    limb(13, -18, fa, 9.5, fa - fb, 9.5, 4.2, 2.6);
+    const ha = 0.3 + sw * Math.sin(ph) * (1 - e) - e * 0.1;
+    const hb = 0.75 + 0.7 * Math.max(0, Math.cos(ph)) * g * (1 - e);
+    limb(-19, -20, ha, 11, ha - hb, 12.5, 6.5, 2.8);
+  }
+
+  // tail
+  ctx.lineWidth = 2.2; ctx.beginPath(); ctx.moveTo(-24, -26);
+  const tw = Math.sin(time * 9 + d.phase) * (2 + e * 5);
+  ctx.quadraticCurveTo(-38, -22 + tw * 0.4, -45, -27 - 5 * g + tw); ctx.stroke();
+
+  // body: deep chest, tucked waist, long neck, narrow head
+  ctx.beginPath();
+  ctx.moveTo(-26, -24);
+  ctx.quadraticCurveTo(-24, -32, -12, -33);
+  ctx.quadraticCurveTo(4, -35, 15, -31.5);
+  ctx.quadraticCurveTo(21, -34, 26, -42);
+  ctx.quadraticCurveTo(28, -47, 33, -46.5);
+  ctx.lineTo(46, -41.5);
+  ctx.quadraticCurveTo(47.5, -39.8, 45, -39.3);
+  ctx.lineTo(33, -38.2);
+  ctx.quadraticCurveTo(27, -34, 23, -26);
+  ctx.quadraticCurveTo(22, -11, 12, -11.5);
+  ctx.quadraticCurveTo(0, -13, -9, -21.5);
+  ctx.quadraticCurveTo(-16, -17, -22, -16);
+  ctx.quadraticCurveTo(-28, -18, -26, -24);
+  ctx.closePath(); ctx.fill();
+  // ear, folded back
+  ctx.beginPath(); ctx.moveTo(30, -46.5); ctx.quadraticCurveTo(24, -50 - 2 * g, 20.5, -46); ctx.lineTo(27.5, -43); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+/* ------------------------------------------------------------- suits */
+
+function makeSuit() {
+  return { state: 'stuck', x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, hx: jail.x, hy: jail.y - 50 * S,
+           rot: 0, spin: 0, stretch: 1, phase: rand(0, TAU), face: 1, t: 0, seed: rand(0, TAU),
+           eaten: 0, edge: null, edgeT: 0, free: false };
+}
+
+// Draws a suit with feet at the origin. mode: stand | bars | run | hang | lie
+function drawSuit(mode, p, face) {
+  ctx.fillStyle = ctx.strokeStyle = INK; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.save(); ctx.scale(face, 1);
+  let l1, l2, a1, a2, lean = 0, bob = 0;
+  if (mode === 'run')       { l1 = Math.sin(p) * 0.95; l2 = -l1; a1 = 2.75 + Math.sin(p * 1.3) * 0.35; a2 = -2.6 + Math.cos(p * 1.1) * 0.4; lean = 0.2; bob = Math.abs(Math.sin(p)) * 2.5; }
+  else if (mode === 'hang') { l1 = 0.25 + Math.sin(p) * 0.6; l2 = -0.25 + Math.sin(p + 2.4) * 0.6; a1 = 1.1 + Math.sin(p * 1.2) * 0.7; a2 = -1.1 + Math.cos(p * 1.4) * 0.7; }
+  else if (mode === 'lie')  { l1 = 0.5 + Math.sin(p) * 0.3; l2 = -0.3 + Math.cos(p) * 0.3; a1 = 2.2 + Math.sin(p) * 0.3; a2 = -1.6 + Math.cos(p) * 0.3; }
+  else if (mode === 'bars') { l1 = 0.08; l2 = -0.08; a1 = 2.35 + Math.sin(p) * 0.06; a2 = -2.35 - Math.sin(p) * 0.06; }
+  else                      { l1 = 0.08; l2 = -0.08; a1 = 0.14; a2 = -0.14; }
+  ctx.translate(0, -bob); ctx.rotate(lean);
+
+  // legs + shoes
+  for (const a of [l1, l2]) {
+    const bend = mode === 'run' || mode === 'hang' ? Math.max(0, -Math.sin(a)) * 0.9 + 0.1 : 0;
+    const [fx, fy] = limb(0, -21, a, 10.5, a - bend, 10.5, 5.2, 4.6);
+    ctx.lineWidth = 3.4; ctx.beginPath(); ctx.moveTo(fx, fy); ctx.lineTo(fx + 4.5, fy + 0.6); ctx.stroke();
+  }
+  // jacket
+  ctx.beginPath();
+  ctx.moveTo(-8.5, -36); ctx.quadraticCurveTo(-8.5, -39.5, -5, -39.5); ctx.lineTo(5, -39.5);
+  ctx.quadraticCurveTo(8.5, -39.5, 8.5, -36); ctx.lineTo(7.5, -18); ctx.lineTo(-7.5, -18);
+  ctx.closePath(); ctx.fill();
+  // shirt and tie: the bit of white that makes it a suit
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.moveTo(-0.8, -39.6); ctx.lineTo(6.2, -39.6); ctx.lineTo(2.7, -27.5); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = INK;
+  ctx.beginPath(); ctx.moveTo(1.9, -39.6); ctx.lineTo(3.5, -39.6); ctx.lineTo(3.9, -32); ctx.lineTo(2.7, -29.6); ctx.lineTo(1.5, -32); ctx.closePath(); ctx.fill();
+  // head
+  ctx.beginPath(); ctx.arc(1.2, -46.6, 5.6, 0, TAU); ctx.fill();
+  // arms, with a white cuff before each hand
+  [[-6.5, a2], [6.5, a1]].forEach(([sx, a]) => {
+    const ea = a * 0.8, ex = sx + Math.sin(ea) * 8, ey = -36.5 + Math.cos(ea) * 8;
+    const hx = ex + Math.sin(a) * 8.5, hy = ey + Math.cos(a) * 8.5;
+    ctx.strokeStyle = INK; ctx.lineWidth = 4.4;
+    ctx.beginPath(); ctx.moveTo(sx, -36.5); ctx.lineTo(ex, ey); ctx.lineTo(hx, hy); ctx.stroke();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 5; ctx.lineCap = 'butt';
+    ctx.beginPath(); ctx.moveTo(ex + (hx - ex) * 0.74, ey + (hy - ey) * 0.74); ctx.lineTo(ex + (hx - ex) * 0.9, ey + (hy - ey) * 0.9); ctx.stroke();
+    ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(hx + Math.sin(a) * 1.2, hy + Math.cos(a) * 1.2, 2.3, 0, TAU); ctx.fill();
+  });
+  ctx.restore();
+}
+
+function release(s) {
+  const now = performance.now(), sm = pointer.samples.filter(q => now - q.t < 110);
+  let vx = 0, vy = 0;
+  if (sm.length > 1) {
+    const a = sm[0], b = sm[sm.length - 1], dt = Math.max(0.016, (b.t - a.t) / 1000);
+    vx = (b.x - a.x) / dt; vy = (b.y - a.y) / dt;
+  }
+  const sp = hyp(vx, vy), cap = 1700;
+  if (sp > cap) { vx *= cap / sp; vy *= cap / sp; }
+  const lift = 28 * S;
+  s.x = s.hx; s.y = (s.hy + 40 * S + lift) / K; s.z = lift;
+  s.vx = vx; s.vy = vy / K; s.vz = Math.min(360, 60 + sp * 0.16);
+  s.spin = clamp(vx * 0.006, -9, 9); s.state = 'fly';
+  if (Math.abs(vx) > 30) s.face = Math.sign(vx);
+}
+
+function pickEdge(s) {
+  let ax = 0, ay = 0;
+  for (const d of dogs) {
+    const dx = s.x - d.x, dy = s.y - d.y, q = hyp(dx, dy) || 1;
+    if (q < 700) { ax += dx / q / q; ay += dy / q / q; }
+  }
+  const al = hyp(ax, ay); if (al > 0) { ax /= al; ay /= al; }
+  const opts = [[-1, 0, s.x], [1, 0, W - s.x], [0, -1, s.y], [0, 1, H / K - s.y]];
+  let best = null, bs = 1e9;
+  for (const [ex, ey, dist] of opts) {
+    const score = dist * (1.25 - 0.75 * (ex * ax + ey * ay)) - (s.edge && s.edge[0] === ex && s.edge[1] === ey ? 60 : 0);
+    if (score < bs) { bs = score; best = [ex, ey]; }
+  }
+  s.edge = best; s.away = [ax, ay];
+}
+
+function updateSuits(dt) {
+  for (let i = suits.length - 1; i >= 0; i--) {
+    const s = suits[i];
+    s.phase += dt * (s.state === 'run' ? 19 : s.state === 'down' ? 22 : 13);
+    if (s.state === 'stuck') {
+      // still gripping the bars: stretch until he pops free
+      const ax = jail.x, ay = jail.y - 50 * S;
+      const dx = pointer.x - ax, dy = pointer.y - ay, q = hyp(dx, dy);
+      if (q > 105 * S) { s.state = 'held'; s.free = true; everReleased = true; }
+      const j = Math.min(1, q / 60) * 1.6;
+      s.hx = ax + dx * 0.34 + rand(-j, j); s.hy = ay + dy * 0.34 + rand(-j, j);
+      s.stretch = 1 + q / (240 * S);
+      s.rot = clamp(dx / (260 * S), -0.6, 0.6);
+    } else if (s.state === 'held') {
+      const f = 1 - Math.exp(-dt * 15), px = s.hx;
+      s.hx += (pointer.x - s.hx) * f; s.hy += (pointer.y - s.hy) * f;
+      const sw = clamp(-(s.hx - px) / dt * 0.0022, -1.1, 1.1) + Math.sin(s.phase * 0.9) * 0.1;
+      s.rot += (sw - s.rot) * Math.min(1, dt * 9);
+      s.stretch += (1 - s.stretch) * Math.min(1, dt * 12);
+    } else if (s.state === 'fly') {
+      s.vz -= 1500 * dt; s.z += s.vz * dt; s.x += s.vx * dt; s.y += s.vy * dt; s.rot += s.spin * dt;
+      if (s.z <= 0) {
+        s.z = 0; s.state = 'tumble';
+        s.t = 0.22 + Math.min(0.5, hyp(s.vx, s.vy * K) / 2200);
+      }
+    } else if (s.state === 'tumble') {
+      const fr = Math.exp(-dt * 5); s.vx *= fr; s.vy *= fr;
+      s.x += s.vx * dt; s.y += s.vy * dt;
+      s.rot += (s.face * 1.45 - s.rot) * Math.min(1, dt * 14);
+      s.t -= dt; if (s.t <= 0) { s.state = 'run'; s.rot = 0; s.edgeT = 0; }
+    } else if (s.state === 'run') {
+      s.edgeT -= dt; if (s.edgeT <= 0) { pickEdge(s); s.edgeT = 0.35; }
+      let ux = s.edge[0] + s.away[0] * 0.75, uy = s.edge[1] + s.away[1] * 0.75;
+      const ul = hyp(ux, uy) || 1, sp = 262 * S;
+      const f = Math.min(1, dt * 7);
+      s.vx += (ux / ul * sp - s.vx) * f; s.vy += (uy / ul * sp - s.vy) * f;
+      s.x += s.vx * dt; s.y += s.vy * dt;
+      if (Math.abs(s.vx) > 25) s.face = Math.sign(s.vx);
+    } else if (s.state === 'down') {
+      let eaters = 0;
+      for (const d of dogs) if (d.eating && d.target === s) eaters++;
+      if (eaters) {
+        s.eaten += dt * (0.05 + 0.045 * eaters);
+        if (Math.random() < dt * 5 * eaters) scraps.push({
+          x: s.x + rand(-10, 10), y: s.y + rand(-8, 8), z: rand(6, 16),
+          vx: rand(-130, 130), vy: rand(-110, 110), vz: rand(120, 300),
+          r: rand(0, TAU), vr: rand(-14, 14), w: rand(3, 8) * S, h: rand(2, 5) * S, life: rand(2.5, 4.5) });
+      }
+      if (s.eaten >= 1) { remains.push({ x: s.x, y: s.y, r: rand(-0.8, 0.8), life: 6 }); suits.splice(i, 1); continue; }
+    }
+
+    if (s.state === 'run' || s.state === 'tumble') {
+      for (const d of dogs) if (hyp(d.x - s.x, d.y - s.y) < 25 * S) {
+        s.state = 'down'; s.vx = s.vy = 0; s.face = d.x < s.x ? 1 : -1; break;
+      }
+    }
+    if (s.state === 'run' || s.state === 'fly' || s.state === 'tumble') {
+      const sy = s.y * K;
+      if (s.x < -34 || s.x > W + 34 || sy < -6 || sy > H + 60) suits.splice(i, 1);   // got away
+    }
+  }
+
+  for (let i = scraps.length - 1; i >= 0; i--) {
+    const c = scraps[i];
+    if (c.z > 0 || c.vz > 0) {
+      c.vz -= 900 * dt; c.z += c.vz * dt; c.x += c.vx * dt; c.y += c.vy * dt; c.r += c.vr * dt;
+      if (c.z < 0) { c.z = 0; c.vz = 0; }
+    }
+    c.life -= dt; if (c.life <= 0) scraps.splice(i, 1);
+  }
+  for (let i = remains.length - 1; i >= 0; i--) { remains[i].life -= dt; if (remains[i].life <= 0) remains.splice(i, 1); }
+}
+
+function drawGroundSuit(s) {
+  ctx.save();
+  ctx.translate(s.x, s.y * K - s.z);
+  if (s.state === 'down') {
+    const k = 1 - 0.8 * s.eaten;
+    ctx.translate(rand(-1.5, 1.5), rand(-1, 1) - 3 * S);
+    ctx.rotate(s.face * 1.5); ctx.scale(S * k, S * k); ctx.translate(0, 22);
+    drawSuit('lie', s.phase, s.face);
+  } else if (s.state === 'fly' || s.state === 'tumble') {
+    ctx.translate(0, -22 * S); ctx.rotate(s.rot); ctx.scale(S, S); ctx.translate(0, 22);
+    drawSuit(s.state === 'fly' ? 'hang' : 'lie', s.phase, s.face);
+  } else {
+    ctx.scale(S, S); drawSuit('run', s.phase, s.face);
+  }
+  ctx.restore();
+}
+
+function drawHeldSuit(s) {
+  ctx.save();
+  ctx.translate(s.hx, s.hy); ctx.rotate(s.rot); ctx.scale(S, S * s.stretch); ctx.translate(0, 40);
+  drawSuit(s.state === 'stuck' ? 'bars' : 'hang', s.phase, 1);
+  ctx.restore();
+}
+
+/* -------------------------------------------------------------- jail */
+
+function inJail(x, y, pad) {
+  return Math.abs(x - jail.x) < jail.w / 2 + pad && y > jail.y - jail.h - pad && y < jail.y + pad + 22 * S;
+}
+
+function drawJail() {
+  const { x, y, w, h } = jail, x0 = x - w / 2, y0 = y - h;
+  // nearest dog makes the inmates nervous
+  let near = 1e9; for (const d of dogs) near = Math.min(near, hyp(d.x - x, d.y * K - y + h / 2));
+  const fear = clamp(1 - (near - 60) / 200, 0, 1);
+  const taken = held && held.state === 'stuck' ? 2 : -1;
+  for (let i = 0; i < 5; i++) {
+    if (i === taken) continue;
+    const u = (i + 0.5) / 5, back = i % 2;
+    ctx.save();
+    ctx.translate(x0 + 12 * S + u * (w - 24 * S) + Math.sin(time * 23 + i * 2) * fear * 1.2,
+                  y - 7 * S - back * 5 * S - Math.abs(Math.sin(time * 2.1 + i * 1.7)) * 1.5 * S);
+    const k = S * (back ? 1.02 : 1.1); ctx.scale(k, k);
+    drawSuit(i === 1 || i === 4 ? 'bars' : 'stand', time * 3 + i, i < 2 ? 1 : -1);
+    ctx.restore();
+  }
+  ctx.fillStyle = INK;
+  const nb = 8, bw = 3.2 * S;
+  for (let i = 0; i <= nb; i++) ctx.fillRect(x0 + (w - bw) * i / nb, y0, bw, h);
+  ctx.fillRect(x0 - 5 * S, y0 - 5 * S, w + 10 * S, 9 * S);
+  ctx.fillRect(x0 - 5 * S, y - 6 * S, w + 10 * S, 8 * S);
+  ctx.fillRect(x0, y0 + h * 0.52, w, 2.6 * S);
+
+  ctx.font = `600 ${Math.round(10.5 * Math.max(S, 0.85))}px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if ('letterSpacing' in ctx) ctx.letterSpacing = '0.22em';
+  ctx.fillText('DROP A SUIT', x + 1.5, y + 17 * S);
+
+  // first-time hint: pull one out
+  hintAlpha += ((everReleased ? 0 : 1) - hintAlpha) * 0.06;
+  if (hintAlpha > 0.01 && !held) {
+    const b = (time * 0.9) % 1, up = b * 16 * S;
+    ctx.save();
+    ctx.globalAlpha = hintAlpha * Math.sin(b * Math.PI);
+    ctx.strokeStyle = INK; ctx.lineWidth = 1.6; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const ay = y0 - 16 * S - up;
+    ctx.beginPath(); ctx.moveTo(x, ay + 16 * S); ctx.lineTo(x, ay);
+    ctx.moveTo(x - 5 * S, ay + 6 * S); ctx.lineTo(x, ay); ctx.lineTo(x + 5 * S, ay + 6 * S); ctx.stroke();
+    ctx.globalAlpha = hintAlpha;
+    ctx.fillText('DRAG ONE OUT', x + 1.5, y0 - 46 * S);
+    ctx.restore();
+  }
+  if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+}
+
+/* ------------------------------------------------------------- frame */
+
+function shadow(x, gy, rx, ry, a) {
+  ctx.globalAlpha = a; ctx.beginPath(); ctx.ellipse(x, gy * K, rx, ry, 0, 0, TAU); ctx.fill();
+}
+
+function draw() {
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H);
+
+  ctx.fillStyle = INK;
+  for (const d of dogs) shadow(d.x, d.y, 30 * S * d.fore, 6.5 * S, 0.09);
+  for (const s of suits) {
+    if (s.state === 'stuck') continue;
+    if (s.state === 'held') shadow(s.hx, (s.hy + 68 * S) / K, 9 * S, 3 * S, 0.07);
+    else { const k = 1 / (1 + s.z / 60); shadow(s.x, s.y, 13 * S * k, 4.5 * S * k, 0.1 * k); }
+  }
+  ctx.globalAlpha = 1;
+
+  for (const r of remains) {      // all that's left: the tie
+    ctx.save(); ctx.globalAlpha = clamp(r.life / 2, 0, 1);
+    ctx.translate(r.x, r.y * K); ctx.rotate(r.r); ctx.scale(S * 1.5, S * 0.9);
+    ctx.beginPath(); ctx.moveTo(-1.6, -7); ctx.lineTo(1.6, -7); ctx.lineTo(2.6, 4); ctx.lineTo(0, 8); ctx.lineTo(-2.6, 4); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  for (const c of scraps) {
+    ctx.save(); ctx.globalAlpha = clamp(c.life, 0, 1);
+    ctx.translate(c.x, c.y * K - c.z); ctx.rotate(c.r); ctx.fillRect(-c.w / 2, -c.h / 2, c.w, c.h);
+    ctx.restore();
+  }
+
+  // painter's order by depth on the ground plane
+  const list = [{ y: (jail.y - 4 * S) / K, f: drawJail }];
+  for (const d of dogs) list.push({ y: d.y, f: () => drawDog(d) });
+  for (const s of suits) if (s.state !== 'held' && s.state !== 'stuck') list.push({ y: s.y - (s.state === 'down' ? 6 : 0), f: () => drawGroundSuit(s) });
+  list.sort((a, b) => a.y - b.y);
+  for (const it of list) it.f();
+  if (held) drawHeldSuit(held);
+}
+
+let last = 0;
+function frame(t) {
+  const dt = Math.min(0.034, (t - last) / 1000 || 0.016); last = t; time += dt;
+  updateDogs(dt); updateSuits(dt); draw();
+  requestAnimationFrame(frame);
+}
+
+/* ------------------------------------------------------------- input */
+
+function track(e) {
+  pointer.x = e.clientX; pointer.y = e.clientY;
+  const now = performance.now();
+  pointer.samples.push({ x: e.clientX, y: e.clientY, t: now });
+  while (pointer.samples.length > 12) pointer.samples.shift();
+}
+function setCursor() {
+  let c = 'default';
+  if (held) c = 'grabbing';
+  else if (inJail(pointer.x, pointer.y, 8) || nearSuit(pointer.x, pointer.y)) c = 'grab';
+  canvas.style.cursor = c;
+}
+function nearSuit(x, y) {
+  for (const s of suits) if (s.state === 'run' && hyp(s.x - x, s.y * K - 24 * S - y) < 30 * S) return s;
+  return null;
+}
+
+canvas.addEventListener('pointerdown', e => {
+  if (e.button > 0) return;
+  track(e); pointer.down = true; pointer.active = true; pointer.samples.length = 0; track(e);
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  const s = nearSuit(e.clientX, e.clientY);
+  if (s) {           // snatch a runner back up
+    s.state = 'held'; s.free = true; s.hx = s.x; s.hy = s.y * K - 40 * S; s.rot = 0; s.stretch = 1; held = s;
+  } else if (inJail(e.clientX, e.clientY, 10)) {
+    held = makeSuit(); suits.push(held);
+  }
+  setCursor(); e.preventDefault();
+});
+canvas.addEventListener('pointermove', e => {
+  track(e);
+  if (e.pointerType === 'mouse' || pointer.down) pointer.active = true;
+  setCursor();
+});
+function up(e) {
+  if (e.pointerType !== 'mouse') pointer.active = false;
+  pointer.down = false;
+  if (held) {
+    if (held.state === 'stuck') suits.splice(suits.indexOf(held), 1);   // let go too early: back inside
+    else release(held);
+    held = null;
+  }
+  setCursor();
+}
+canvas.addEventListener('pointerup', up);
+canvas.addEventListener('pointercancel', up);
+document.addEventListener('mouseleave', () => { if (!pointer.down) pointer.active = false; });
+window.addEventListener('blur', () => { if (!pointer.down) pointer.active = false; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('resize', resize);
+
+resize();
+wander.x = W / 2; wander.y = H / K / 2;
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
